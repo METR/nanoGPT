@@ -114,6 +114,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    embedding_adapter_dim: int | None = None # True: use adapter, False: use original embedding
 
 class GPT(nn.Module):
 
@@ -136,6 +137,9 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if config.embedding_adapter_dim is not None:
+            self.embedding_adapter = nn.Linear(config.embedding_adapter_dim, config.n_embd, bias=True)
+            self.unembedding_adapter = nn.Linear(config.n_embd, config.embedding_adapter_dim, bias=True)
 
         # init all weights
         self.apply(self._init_weights)
@@ -176,6 +180,7 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.embedding_adapter(tok_emb) if tok_emb.size(-1) != pos_emb.size(-1) else tok_emb
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -183,6 +188,8 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            if self.config.embedding_adapter_dim is not None:
+                x = self.unembedding_adapter(x)
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
@@ -235,7 +242,9 @@ class GPT(nn.Module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
+        print("loading huggingface")
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        print("huggingface loaded")
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
@@ -269,10 +278,11 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
+        # optim_groups = [
+        #     {'params': decay_params, 'weight_decay': weight_decay},
+        #     {'params': nodecay_params, 'weight_decay': 0.0}
+        # ]
+        param_groups = [{'params': self.embedding_adapter, 'weight_decay': weight_decay},]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
