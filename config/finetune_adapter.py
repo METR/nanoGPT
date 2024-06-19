@@ -21,8 +21,10 @@ gradient_accumulation_steps = 1
 max_iters = 40
 
 # finetune at constant LR
-learning_rate = 1e-3
+# learning_rate = 1e-3
+learning_rate = 1e-5
 decay_lr = False
 embedding_adapter_dim = 768
+only_train_adapter = False
 device='mps'
-# compile=False
+compile=False

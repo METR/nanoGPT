@@ -115,6 +115,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     embedding_adapter_dim: int | None = None # True: use adapter, False: use original embedding
+    only_train_adapter: bool = False # True: only train adapter, False: train all
 
 class GPT(nn.Module):
 
@@ -279,7 +280,7 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        if self.config.embedding_adapter_dim is not None:
+        if self.config.embedding_adapter_dim is not None and self.config.only_train_adapter:
             print("training only adapter weights")
             optim_groups = [{'params': [self.embedding_adapter.weight, self.unembedding_adapter.weight], 'weight_decay': weight_decay},]
         else:

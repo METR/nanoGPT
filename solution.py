@@ -76,7 +76,7 @@ plot_embeddings(small_projected_to_large[:100, :100], "small projected to large"
 model_with_small_embeddings = GPT(model.config)
 model_with_small_embeddings.load_state_dict(large_state_dict)
 model_with_small_embeddings.transformer.wte.weight.data = small_projected_to_large
-torch.save({**model_with_small_embeddings.state_dict(), "config":model.config}, 'model_with_small_embeddings.pth')
+torch.save({**model_with_small_embeddings.state_dict(), "config":model.config}, 'model_small_projected_embeddings.pth')
 # %%
 plot_embeddings(large_embedding[:100, :100], "large raw")
 plot_embeddings(small_embedding[:100, :100], "small raw")
