@@ -24,3 +24,4 @@ max_iters = 20
 learning_rate = 3e-5
 decay_lr = False
 embedding_adapter_dim = 768
+device='mps'
