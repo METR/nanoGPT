@@ -139,8 +139,8 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         if config.embedding_adapter_dim is not None:
-            self.embedding_adapter = nn.Linear(config.embedding_adapter_dim, config.n_embd, bias=True)
-            self.unembedding_adapter = nn.Linear(config.n_embd, config.embedding_adapter_dim, bias=True)
+            self.embedding_adapter = nn.Linear(config.embedding_adapter_dim, config.n_embd, bias=False)
+            self.unembedding_adapter = nn.Linear(config.n_embd, config.embedding_adapter_dim, bias=False)
 
         # init all weights
         self.apply(self._init_weights)
@@ -279,11 +279,13 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        # optim_groups = [
-        #     {'params': decay_params, 'weight_decay': weight_decay},
-        #     {'params': nodecay_params, 'weight_decay': 0.0}
-        # ]
-        param_groups = [{'params': self.embedding_adapter, 'weight_decay': weight_decay},]
+        if self.config.embedding_adapter_dim is not None:
+            optim_groups = [{'params': [self.embedding_adapter.weight, self.unembedding_adapter.weight], 'weight_decay': weight_decay},]
+        else:
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
