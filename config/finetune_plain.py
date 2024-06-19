@@ -22,7 +22,7 @@ gradient_accumulation_steps = 1
 max_iters = 40
 
 # finetune at constant LR
-learning_rate = 1e-5
+learning_rate = 1e-4
 decay_lr = False
 device='mps'
 compile=False
