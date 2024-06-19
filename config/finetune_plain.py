@@ -8,7 +8,7 @@ wandb_project = 'openwebtext'
 wandb_run_name = 'ft-' + str(time.time())
 
 dataset = 'openwebtext'
-init_from = 'model_small_embedding_adapter.pth'
+init_from = 'large_model.pth'
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
@@ -21,8 +21,7 @@ gradient_accumulation_steps = 1
 max_iters = 40
 
 # finetune at constant LR
-learning_rate = 1e-3
+learning_rate = 3e-5
 decay_lr = False
-embedding_adapter_dim = 768
 device='mps'
-# compile=False
+compile=False

@@ -280,6 +280,7 @@ class GPT(nn.Module):
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         if self.config.embedding_adapter_dim is not None:
+            print("training only adapter weights")
             optim_groups = [{'params': [self.embedding_adapter.weight, self.unembedding_adapter.weight], 'weight_decay': weight_decay},]
         else:
             optim_groups = [
