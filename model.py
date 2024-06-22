@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+import functools
 
 import torch
 import torch.nn as nn
@@ -31,6 +32,10 @@ import torch.nn.functional as F
 import math
 import torch.distributed as dist
 
+@functools.cache
+def get_world_size_rank():
+    return dist.get_world_size(),dist.get_rank()
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -50,8 +55,6 @@ class CausalSelfAttention(nn.Module):
         # Initialize process group
         if not dist.is_initialized():
             dist.init_process_group(backend='nccl')
-        self.world_size = dist.get_world_size()
-        self.rank = dist.get_rank()
         
         # Flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -66,8 +69,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         
         # Calculate local sequence length
-        local_T = T // self.world_size
-        start_idx = self.rank * local_T
+        world_size, rank = get_world_size_rank()
+        local_T = T // world_size
+        start_idx = rank * local_T
         end_idx = start_idx + local_T
         
         # Split input along sequence length
@@ -79,9 +83,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, local_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, local_T, hs)
         v = v.view(B, local_T, self.n_head, C // self.n_head).transpose(1, 2).contiguous() # (B, nh, local_T, hs)
 
+        # in order to not copy lists into one tensor, need distributed dim to be first
+
         # Gather all keys and values across GPUs
-        k_all = [torch.zeros_like(k) for _ in range(self.world_size)]
-        v_all = [torch.zeros_like(v) for _ in range(self.world_size)]
+        k_all = [torch.zeros_like(k) for _ in range(world_size)]
+        v_all = [torch.zeros_like(v) for _ in range(world_size)]
         dist.all_gather(k_all, k)
         dist.all_gather(v_all, v)
         k_all = torch.cat(k_all, dim=2)
@@ -110,7 +116,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         # Gather results from all GPUs
-        y_all = [torch.zeros_like(y) for _ in range(self.world_size)]
+        y_all = [torch.zeros_like(y) for _ in range(world_size)]
         dist.all_gather(y_all, y)
         y_all = torch.cat(y_all, dim=1)
 
@@ -212,7 +218,14 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        if True:
+            world_size, rank = get_world_size_rank()
+            
+            block_size_per_process = self.config.block_size // world_size
+            block_size_offset = block_size_per_process * rank
+            pos = torch.arange(0+block_size_offset, t+block_size_offset, dtype=torch.long, device=device)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -231,7 +244,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
