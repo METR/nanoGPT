@@ -58,7 +58,7 @@ class CausalSelfAttention(nn.Module):
         
         # Flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        self.flash = False
+        # self.flash = False
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -88,8 +88,8 @@ class CausalSelfAttention(nn.Module):
         # Gather all keys and values across GPUs
         k_all = [torch.zeros_like(k) for _ in range(world_size)]
         v_all = [torch.zeros_like(v) for _ in range(world_size)]
-        dist.all_gather(k_all, k)
-        dist.all_gather(v_all, v)
+        # dist.all_gather(k_all, k)
+        # dist.all_gather(v_all, v)
         k_all = torch.cat(k_all, dim=2)
         v_all = torch.cat(v_all, dim=2)
 
