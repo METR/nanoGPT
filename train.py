@@ -186,6 +186,13 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+elif os.path.exists(init_from):
+    state_dict = torch.load(init_from)
+    model = GPT(state_dict['config'])
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = getattr(state_dict['config'], k)
+    del state_dict['config']
+    model.load_state_dict(state_dict, strict=False)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
