@@ -76,6 +76,7 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+model_output_path = 'trained_model.pt'
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -291,6 +292,13 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            torch.save(
+                {
+                    **raw_model.state_dict(),
+                    "config": raw_model.config,
+                },
+                model_output_path,
+            )
     if iter_num == 0 and eval_only:
         break
 
