@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+import functools
 
 import torch
 import torch.nn as nn
@@ -25,9 +26,17 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch.distributed as dist
+
+@functools.cache
+def get_world_size_rank():
+    return dist.get_world_size(), dist.get_rank()
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -51,24 +60,51 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        
+        # Calculate local sequence length
+        world_size, rank = get_world_size_rank()
+        
+        # Split input along sequence length
+        
+        # Calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2).contiguous() # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2).contiguous() # (B, nh, local_T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # in order to not copy lists into one tensor, need distributed dim to be first
+
+        # Gather all keys and values across GPUs
+        k_all = [torch.zeros_like(k) for _ in range(world_size)]
+        v_all = [torch.zeros_like(v) for _ in range(world_size)]
+        dist.barrier()
+        # print("passed barrier")
+        # dist.all_gather(k_all, k)
+        # dist.all_gather(v_all, v)
+        # dist.barrier()
+        k_all = torch.cat(k_all, dim=2)
+        v_all = torch.cat(v_all, dim=2)
+
+        # Causal self-attention
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # Efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k_all, v_all, attn_mask=None, 
+                dropout_p=self.dropout if self.training else 0, 
+                is_causal=True
+            )
+            # print("attention output shape", y.shape)
         else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # Manual implementation of attention
+            att = (q @ k_all.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # print("att shape", att.shape)
+            # b h T_to T_from
+            causal_mask = self.bias[:,:,rank*T:(rank+1)*T,:T*world_size].to(att.device)
+            att = att.masked_fill(causal_mask== 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v_all # (B, nh, local_T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -177,7 +213,14 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        if True:
+            world_size, rank = get_world_size_rank()
+            
+            block_size_per_process = self.config.block_size // world_size
+            block_size_offset = block_size_per_process * rank
+            pos = torch.arange(0+block_size_offset, t+block_size_offset, dtype=torch.long, device=device)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -244,9 +287,7 @@ class GPT(nn.Module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
-        print("loading huggingface")
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        print("huggingface loaded")
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
@@ -313,7 +354,8 @@ class GPT(nn.Module):
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        # flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_promised = 1e15 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
