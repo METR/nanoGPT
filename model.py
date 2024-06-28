@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torchtune
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -49,6 +50,8 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        if self.config.mu_parameterization:
+            self.rope = torchtune.modules.RotaryPositionalEmbeddings(config.n_embd//config.n_head, config.block_size )
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -63,6 +66,7 @@ class CausalSelfAttention(nn.Module):
         if self.flash:
             if self.config.mu_parameterization:
                 # torch attention uses cale factor 1/sqrt(h), we divide by sqrt to make it in total 1/h
+                q = self.rope(q)
                 q *= 1.0 / math.sqrt(q.size(-1))
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
@@ -202,7 +206,8 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        emb = tok_emb if self.config.mu_parameterization else tok_emb + pos_emb
+        x = self.transformer.drop(emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
