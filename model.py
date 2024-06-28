@@ -111,8 +111,8 @@ class Block(nn.Module):
         if self.config.mu_parameterization:
             def rmsnorm(x):
                 return x / torch.norm(x, dim=-1, keepdim=True)
-            x = x + rmsnorm(self.attn(rmsnorm(x)))
-            x = x + rmsnorm(self.mlp(rmsnorm(x)))
+            x = x + rmsnorm(self.attn(rmsnorm(x)))/math.sqrt(self.config.n_layer)
+            x = x + rmsnorm(self.mlp(rmsnorm(x)))/math.sqrt(self.config.n_layer)
         else:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
@@ -310,7 +310,7 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(optim_groups, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
