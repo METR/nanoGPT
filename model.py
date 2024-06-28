@@ -30,6 +30,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -57,14 +58,18 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
+        
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
+            if self.config.mu_parameterization:
+                # torch attention uses cale factor 1/sqrt(h), we divide by sqrt to make it in total 1/h
+                q *= 1.0 / math.sqrt(q.size(-1))
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            scale_factor = 1.0/k.size(-1) if self.config.mu_parameterization else 1.0 / math.sqrt(k.size(-1))
+            att = (q @ k.transpose(-2, -1)) * scale_factor
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -95,14 +100,22 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.config = config
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        if not self.config.mu_parameterization:
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.config.mu_parameterization:
+            def rmsnorm(x):
+                return x / torch.norm(x, dim=-1, keepdim=True)
+            x = x + rmsnorm(self.attn(rmsnorm(x)))
+            x = x + rmsnorm(self.mlp(rmsnorm(x)))
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -114,6 +127,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    mu_parameterization: bool = False # True: use mu parameterization, False: use standard GPT-2
 
 class GPT(nn.Module):
 
@@ -143,7 +157,17 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
+                
+        if self.config.mu_parameterization:
+            for pn, p in self.named_parameters():
+                if pn.endswith('wte.weight') or pn.endswith('wpe.weight'):
+                    torch.nn.init.normal_(p, mean=0.0, std=1)
+                else:
+                    torch.nn.init.normal_(p, mean=0.0, std=math.sqrt(1/p.size(1)))
+                if pn.endswith('c_attn.weight'):
+                    # set query to zero
+                    p.data[:, :self.config.n_embd] = 0.0
+            
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -184,6 +208,8 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            if self.config.mu_parameterization:
+                logits = logits / self.config.n_embd
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -267,11 +293,14 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2 and 'wte.weight' not in n and 'wpe.weight' not in n]
+        embedding_params = [p for n, p in param_dict.items() if 'wte.weight' in n or 'wpe.weight' in n]
+        
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': decay_params, 'weight_decay': weight_decay, 'lr':learning_rate/self.config.n_embd},
+            {'params': embedding_params, 'weight_decay': 0.0, 'lr': learning_rate},
+            {'params': nodecay_params, 'weight_decay': 0.0, "lr":learning_rate/self.config.n_embd}
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
