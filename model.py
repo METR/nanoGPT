@@ -29,9 +29,10 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, i):
         super().__init__()
         self.config = config
+        self.i = i
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -67,7 +68,7 @@ class CausalSelfAttention(nn.Module):
             if self.config.mu_parameterization:
                 # torch attention uses cale factor 1/sqrt(h), we divide by sqrt to make it in total 1/h
                 q = self.rope(q)
-                q *= 1.0 / math.sqrt(q.size(-1))
+                q = q / math.sqrt(q.size(-1))
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
@@ -86,8 +87,10 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, i):
         super().__init__()
+        self.config = config
+        self.i = i
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
@@ -95,6 +98,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
+        print("neuron var layer", self.i, torch.mean(torch.var(x, dim=-1,)))
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -106,8 +110,8 @@ class Block(nn.Module):
         super().__init__()
         self.config = config
         self.i = i
-        self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        self.attn = CausalSelfAttention(config, i)
+        self.mlp = MLP(config, i)
         if not self.config.mu_parameterization:
             self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
             self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -115,10 +119,14 @@ class Block(nn.Module):
     def forward(self, x):
         if self.config.mu_parameterization:
             def rmsnorm(x):
-                return x / torch.norm(x, dim=-1, keepdim=True)
-            x = x + rmsnorm(self.attn(rmsnorm(x)))/math.sqrt(self.config.n_layer)
-            x = x + rmsnorm(self.mlp(rmsnorm(x)))/math.sqrt(self.config.n_layer)
-            # print("norm at layer", self.i, torch.mean(torch.norm(x, dim=-1,))) # in mu parameterization, norm should be 1
+                return x / torch.linalg.vector_norm(x, dim=-1, keepdim=True)
+            print("var before layer", self.i, torch.mean(torch.var(x, dim=-1,)))
+            attn_out = self.attn(rmsnorm(x))
+            print("attn var", self.i, torch.mean(torch.var(attn_out, dim=-1,)))
+            x = x + rmsnorm(attn_out)/math.sqrt(self.config.n_layer)
+            mlp_out = self.mlp(rmsnorm(x))
+            print("mlp var", self.i, torch.mean(torch.var(mlp_out, dim=-1,)))
+            x = x + rmsnorm(mlp_out)/math.sqrt(self.config.n_layer)
         else:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
@@ -155,7 +163,8 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if not self.config.mu_parameterization:
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -168,11 +177,18 @@ class GPT(nn.Module):
             for pn, p in self.named_parameters():
                 if pn.endswith('wte.weight') or pn.endswith('wpe.weight'):
                     torch.nn.init.normal_(p, mean=0.0, std=1)
+                elif pn.endswith('c_proj.weight'):
+                    torch.nn.init.normal_(p, mean=0.0, std=1/math.sqrt(self.config.n_embd)/2)
+                elif pn.endswith('lm_head.weight'):
+                    torch.nn.init.normal_(p, mean=0.0, std=1/self.config.n_embd)
                 elif p.dim() > 1 and pn.endswith('weight'):
-                    torch.nn.init.normal_(p, mean=0.0, std=math.sqrt(1/p.size(1)))
-                if pn.endswith('c_attn.weight'):
-                    # set query to zero
-                    p.data[:, :self.config.n_embd] = 0.0
+                    torch.nn.init.normal_(p, mean=0.0, std=1/math.sqrt(self.config.n_embd))
+                    
+                # if pn.endswith('c_attn.weight'):
+                #     # set query to zero
+                #     p.data[:, :self.config.n_embd] = 0.0
+
+                    
             
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
