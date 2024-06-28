@@ -118,7 +118,7 @@ class Block(nn.Module):
                 return x / torch.norm(x, dim=-1, keepdim=True)
             x = x + rmsnorm(self.attn(rmsnorm(x)))/math.sqrt(self.config.n_layer)
             x = x + rmsnorm(self.mlp(rmsnorm(x)))/math.sqrt(self.config.n_layer)
-            print("norm at layer", self.i, torch.mean(torch.norm(x, dim=-1,))) # in mu parameterization, norm should be 1
+            # print("norm at layer", self.i, torch.mean(torch.norm(x, dim=-1,))) # in mu parameterization, norm should be 1
         else:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
@@ -168,7 +168,7 @@ class GPT(nn.Module):
             for pn, p in self.named_parameters():
                 if pn.endswith('wte.weight') or pn.endswith('wpe.weight'):
                     torch.nn.init.normal_(p, mean=0.0, std=1)
-                else:
+                elif p.dim() > 1 and pn.endswith('weight'):
                     torch.nn.init.normal_(p, mean=0.0, std=math.sqrt(1/p.size(1)))
                 if pn.endswith('c_attn.weight'):
                     # set query to zero
