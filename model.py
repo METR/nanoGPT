@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torchtune
+mup_logging_file = open("mup_logging.txt", "w")
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -98,7 +99,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        print("neuron var layer", self.i, torch.mean(torch.var(x, dim=-1,)))
+        print("neuron var layer", self.i, torch.mean(torch.var(x, dim=-1,)), file=mup_logging_file)
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -118,15 +119,17 @@ class Block(nn.Module):
 
     def forward(self, x):
         if self.config.mu_parameterization:
+            layer_factor = 1/math.sqrt(self.config.n_layer*2)
+            layer_antifactor = math.sqrt(1-1/self.config.n_layer*2)
             def rmsnorm(x):
-                return x / torch.linalg.vector_norm(x, dim=-1, keepdim=True)
-            print("var before layer", self.i, torch.mean(torch.var(x, dim=-1,)))
+                return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True))
+            print("var before layer", self.i, torch.mean(torch.var(x, dim=-1,)), file=mup_logging_file)
             attn_out = self.attn(rmsnorm(x))
-            print("attn var", self.i, torch.mean(torch.var(attn_out, dim=-1,)))
-            x = x + rmsnorm(attn_out)/math.sqrt(self.config.n_layer)
+            print("attn var", self.i, torch.mean(torch.var(attn_out, dim=-1,)), file=mup_logging_file)
+            x = x + rmsnorm(attn_out)*layer_factor
             mlp_out = self.mlp(rmsnorm(x))
-            print("mlp var", self.i, torch.mean(torch.var(mlp_out, dim=-1,)))
-            x = x + rmsnorm(mlp_out)/math.sqrt(self.config.n_layer)
+            print("mlp var", self.i, torch.mean(torch.var(mlp_out, dim=-1,)), file=mup_logging_file, flush=True)
+            x = x + rmsnorm(mlp_out)*layer_factor
         else:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
