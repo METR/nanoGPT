@@ -78,7 +78,8 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 lr_decay_iters = max_iters
 
-expected_n_flops = n_layer * n_embd*n_embd * 6 * block_size * batch_size * max_iters
+expected_n_flops = n_layer * n_embd*n_embd * 12 * 6 * block_size * batch_size * max_iters
+print("naive expected n training flops", expected_n_flops)
 assert expected_n_flops < 1e16, "You are only allowed to use up to 10^16 FLOPs per experiment. Please reduce n_embd or max_iters."
 # -----------------------------------------------------------------------------
 
