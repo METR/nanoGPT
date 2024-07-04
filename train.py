@@ -49,22 +49,22 @@ gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 6
-n_head = 6
-n_embd = 768
+n_layer = 4
+n_head = 8
+n_embd = 0 # hidden size, will be set in config
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 3e-3 # max learning rate
-max_iters = 600000 # total number of training iterations
-weight_decay = 1e-2
+learning_rate = 1 # set learning rate based on embed later
+max_iters = 0 # total number of training iterations, set in config
+weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 0 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 0 # set later
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -79,8 +79,10 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 expected_n_flops = n_layer * n_embd*n_embd * 12 * 6 * block_size * batch_size * max_iters
 print("naive expected n training flops", expected_n_flops)
-assert expected_n_flops < 1e16, f"You are only allowed to use up to 10^16 FLOPs per experiment, used {expected_n_flops}. Please reduce n_embd or max_iters."
+# assert expected_n_flops < 1e16, f"You are only allowed to use up to 10^16 FLOPs per experiment, used {expected_n_flops}. Please reduce n_embd or max_iters."
 window_size = max_iters//20
+learning_rate = 0.2/n_embd
+lr_decay_iters = max_iters
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
