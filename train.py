@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-
+os.environ["WANDB_SILENT"] = "true"
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -46,7 +46,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 1 # used to simulate larger batch sizes
-batch_size = 128 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 6
@@ -71,7 +71,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -343,7 +343,8 @@ while True:
     # termination conditions
     if iter_num >= max_iters:
         break
-train_losses_averaged = train_losses[-len(train_losses)%100:].view(-1, 100).mean(dim=1)
+window_size = max_iters//20
+train_losses_averaged = train_losses[-(len(train_losses)%window_size):].view(-1, window_size).mean(dim=1)
 if not os.path.exists("losses"):
     os.mkdir("losses")
 with open(f"losses/{wandb_run_name}.txt", "w") as file:
