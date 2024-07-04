@@ -33,24 +33,24 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 30
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
+wandb_log = True # disabled by default
+wandb_project = 'small_scaling_law'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 1 # used to simulate larger batch sizes
-batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 128 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 6
-n_head = 8
+n_head = 6
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
@@ -63,7 +63,7 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 500 # how many steps to warm up for
+warmup_iters = 0 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
@@ -76,12 +76,10 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
-lr_decay_iters = max_iters
-
+# -----------------------------------------------------------------------------
 expected_n_flops = n_layer * n_embd*n_embd * 12 * 6 * block_size * batch_size * max_iters
 print("naive expected n training flops", expected_n_flops)
 assert expected_n_flops < 1e16, "You are only allowed to use up to 10^16 FLOPs per experiment. Please reduce n_embd or max_iters."
-# -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -180,7 +178,7 @@ elif init_from == 'resume':
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
@@ -191,14 +189,6 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-elif os.path.exists(init_from):
-    state_dict = torch.load(init_from)
-    model = GPT(state_dict['config'])
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(state_dict['config'], k)
-    del state_dict['config']
-    model.load_state_dict(state_dict, strict=False)
-
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -211,7 +201,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'], strict=False)
+    optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -231,14 +221,11 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        from tqdm import tqdm
-        pbar = tqdm(range(eval_iters))
-        for k in pbar:
+        for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
-            pbar.set_description(f"running {split} loss: {losses[:k+1].mean():.4f}")
         out[split] = losses.mean()
     model.train()
     return out
@@ -268,6 +255,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+train_losses = torch.zeros(max_iters*gradient_accumulation_steps)
 while True:
 
     # determine and set the learning rate for this iteration
@@ -276,7 +264,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0 and master_process and False:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -314,11 +302,19 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            train_losses[iter_num] = loss.item()
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+    if wandb_log and iter_num % eval_interval == 0 and master_process:
+        wandb.log({
+            "iter": iter_num,
+            "train/loss": train_losses[iter_num],
+            "lr": lr,
+            "mfu": running_mfu*100, # convert to percentage
+        })
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -345,8 +341,14 @@ while True:
     local_iter_num += 1
 
     # termination conditions
-    if iter_num > max_iters:
+    if iter_num >= max_iters:
         break
+train_losses_averaged = train_losses[-len(train_losses)%100:].view(-1, 100).mean(dim=1)
+if not os.path.exists("losses"):
+    os.mkdir("losses")
+with open(f"losses/{wandb_run_name}.txt", "w") as file:
+    for loss in train_losses_averaged:
+        file.write(f"{loss}\n")
 
 if ddp:
     destroy_process_group()
