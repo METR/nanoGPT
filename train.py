@@ -79,7 +79,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 expected_n_flops = n_layer * n_embd*n_embd * 12 * 6 * block_size * batch_size * max_iters
 print("naive expected n training flops", expected_n_flops)
-assert expected_n_flops < 1e16, "You are only allowed to use up to 10^16 FLOPs per experiment. Please reduce n_embd or max_iters."
+assert expected_n_flops < 1e16, f"You are only allowed to use up to 10^16 FLOPs per experiment, used {expected_n_flops}. Please reduce n_embd or max_iters."
+window_size = max_iters//20
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -308,7 +309,18 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+    t1 = time.time()
+    dt = t1 - t0
+    t0 = t1
     if wandb_log and iter_num % eval_interval == 0 and master_process:
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5: # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        if lossf > 7 and iter_num > 6000:
+            print("Loss too high too late, aborting")
+            break
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         wandb.log({
             "iter": iter_num,
             "train/loss": train_losses[iter_num],
@@ -326,25 +338,13 @@ while True:
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num >= max_iters:
         break
-window_size = max_iters//20
-train_losses_averaged = train_losses[-(len(train_losses)%window_size):].view(-1, window_size).mean(dim=1)
+train_losses_averaged = train_losses[len(train_losses)%window_size:].view(-1, window_size).mean(dim=1)
 if not os.path.exists("losses"):
     os.mkdir("losses")
 with open(f"losses/{wandb_run_name}.txt", "w") as file:
