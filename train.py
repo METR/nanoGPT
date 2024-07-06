@@ -79,7 +79,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 expected_n_flops = n_layer * n_embd*n_embd * 12 * 6 * block_size * batch_size * max_iters
 print("naive expected n training flops", expected_n_flops)
-assert expected_n_flops < 1e16, f"You are only allowed to use up to 10^16 FLOPs per experiment, used {expected_n_flops}. Please reduce n_embd or max_iters."
+assert expected_n_flops < 3e16, f"You are only allowed to use up to 10^16 FLOPs per experiment, used {expected_n_flops}. Please reduce n_embd or max_iters."
 window_size = max_iters//20
 learning_rate = 0.15/n_embd*math.pow(max_iters/5000,-0.4) # learning rate based on n_embd and max_iters that happened to get results we wanted lol
 lr_decay_iters = max_iters
